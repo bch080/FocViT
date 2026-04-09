@@ -13,9 +13,9 @@ import torch
 import torch.distributed as dist
 
 from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
-#from apex import amp
-#from apex.parallel import DistributedDataParallel as DDP
+# from torch.utils.tensorboard import SummaryWriter  # Optional: uncomment if tensorboard is available
+# from apex import amp
+# from apex.parallel import DistributedDataParallel as DDP
 
 from models.modeling import VisionTransformer, CONFIGS
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
@@ -93,7 +93,7 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def valid(args, model, writer, test_loader, global_step):
+def valid(args, model, test_loader, global_step):
     # Validation!
     eval_losses = AverageMeter()
 
@@ -140,8 +140,7 @@ def valid(args, model, writer, test_loader, global_step):
     logger.info("Global Steps: %d" % global_step)
     logger.info("Valid Loss: %2.5f" % eval_losses.avg)
     logger.info("Valid Accuracy: %2.5f" % accuracy)
-
-    writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
+    # writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)  # Optional
     return accuracy
 
 
@@ -149,7 +148,7 @@ def train(args, model):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir, exist_ok=True)
-        writer = SummaryWriter(log_dir=os.path.join("logs", args.name))
+        # writer = SummaryWriter(log_dir=os.path.join("logs", args.name))  # Optional: uncomment for tensorboard
 
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
@@ -225,10 +224,9 @@ def train(args, model):
                     "Training (%d / %d Steps) (loss=%2.5f)" % (global_step, t_total, losses.val)
                 )
                 if args.local_rank in [-1, 0]:
-                    writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
-                    writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
+                    pass  # writer.add_scalar() calls can be uncommented for tensorboard
                 if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                    accuracy = valid(args, model, writer, test_loader, global_step)
+                    accuracy = valid(args, model, test_loader, global_step)
                     if best_acc < accuracy:
                         save_model(args, model)
                         best_acc = accuracy
@@ -241,7 +239,8 @@ def train(args, model):
             break
 
     if args.local_rank in [-1, 0]:
-        writer.close()
+        pass
+        # writer.close()  # Optional: uncomment if using tensorboard
     logger.info("Best Accuracy: \t%f" % best_acc)
     logger.info("End Training!")
 

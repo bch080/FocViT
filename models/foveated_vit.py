@@ -8,7 +8,8 @@ simulating human eye's "central clear, peripheral blur" visual characteristic.
 Core idea:
 - Circular cropping: Keep only patches within radius R_keep = 13.5
 - Center region (r <= 10.5): 8x8 patches, high resolution
-- Outer region (10.5 < r <= 13.5): 16x16 merged patches, lower resolution
+- Outer region (10.5 < r <= 13.5): 2x2 blocks merged to 16x16, lower resolution
+- Discarded region (r > 13.5): corner patches
 
 This reduces token count while maintaining high resolution at the center.
 """
@@ -28,7 +29,6 @@ from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, LayerNorm
 from torch.nn.modules.utils import _pair
 
 import models.configs as configs
-from .modeling_resnet import ResNetV2
 import ml_collections
 
 
@@ -55,8 +55,8 @@ class FoveatedPatchEmbed(nn.Module):
 
     Implements the foveated vision mechanism:
     1. Circular cropping based on distance from center
-    2. Center region: 8x8 patches (high resolution)
-    3. Outer region: 2x2 patches merged to 16x16 (lower resolution)
+    2. Center region (r <= 10.5): 8x8 patches (high resolution)
+    3. Outer region (10.5 < r <= 13.5): 2x2 blocks merged to 16x16 (lower resolution)
     """
 
     def __init__(self, config, img_size=224, base_patch_size=8):
@@ -72,8 +72,7 @@ class FoveatedPatchEmbed(nn.Module):
         # Foveated vision parameters
         self.center = 13.5  # Center coordinates (in patch units)
         self.R_keep = 13.5  # Keep radius (in patch units)
-        self.R_center = 10.5  # Center region radius (r <= R_center: 8x8 patches)
-        # Outer region: R_center < r <= R_keep: 16x16 merged patches
+        self.R_center = 10.5  # Center region radius (r <= R_center)
 
         # Class token
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
@@ -81,13 +80,13 @@ class FoveatedPatchEmbed(nn.Module):
         # Dropout
         self.dropout = Dropout(config.transformer["dropout_rate"])
 
-        # Projection layers for foveated embedding (defined once, reused every forward)
+        # Projection layers for foveated embedding
         # Center: 8x8 patches -> 192 -> hidden_size
         center_in_features = base_patch_size * base_patch_size * 3  # 8*8*3 = 192
         self.center_proj = nn.Linear(center_in_features, config.hidden_size)
 
-        # Outer: 16x16 patches = 4x 8x8 -> 768 -> hidden_size
-        outer_in_features = base_patch_size * base_patch_size * 3 * 4  # 8*8*3*4 = 768
+        # Outer: 2x2 blocks merged to 16x16 -> 768 -> hidden_size
+        outer_in_features = 4 * center_in_features  # 4 * 192 = 768
         self.outer_proj = nn.Linear(outer_in_features, config.hidden_size)
 
         # Precompute patch classification
@@ -96,60 +95,54 @@ class FoveatedPatchEmbed(nn.Module):
     def _compute_patch_info(self):
         """
         Precompute which patches belong to center, outer, or discarded regions.
-        Also compute the merged patch mapping for outer region.
+        Outer patches are the top-left corners of 2x2 blocks.
         """
-        self.center_patches = []  # List of (i, j) positions for 8x8 patches
-        self.outer_patches = []  # List of (i, j) positions for 16x16 patches
+        self.center_patches = []  # List of (i, j) positions for center patches
+        self.outer_patches = []  # List of (i, j) positions (top-left of 16x16 blocks)
         self.discarded_patches = []  # List of (i, j) positions to discard
 
         # Mapping from base patch position to region type
         self.patch_region = {}  # (i, j) -> 'center', 'outer', or 'discarded'
-        self.patch_to_outer_token = {}  # (i, j) -> outer token index
 
-        outer_token_idx = 0
-
+        # First pass: identify valid outer blocks (top-left corners)
+        valid_outer_blocks = []
         for i in range(self.grid_size):
             for j in range(self.grid_size):
-                # Distance from center (using center of patch coordinates)
+                # Only consider patches that could be top-left of a 2x2 block
+                if i % 2 == 0 and j % 2 == 0:
+                    # Check if all 4 patches in the 2x2 block are within R_keep
+                    block_valid = True
+                    for di in range(2):
+                        for dj in range(2):
+                            ni, nj = i + di, j + dj
+                            if ni >= self.grid_size or nj >= self.grid_size:
+                                block_valid = False
+                                break
+                            block_dist = math.sqrt((ni - self.center) ** 2 + (nj - self.center) ** 2)
+                            if block_dist > self.R_keep:
+                                block_valid = False
+                                break
+                        if not block_valid:
+                            break
+                    if block_valid:
+                        valid_outer_blocks.append((i, j))
+
+        # Assign patches to regions
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
                 dist = math.sqrt((i - self.center) ** 2 + (j - self.center) ** 2)
 
-                if dist <= self.R_keep:
-                    # Patch is within the circular region
-                    if dist <= self.R_center:
-                        # Center region: 8x8 patches
-                        self.center_patches.append((i, j))
-                        self.patch_region[(i, j)] = 'center'
-                    else:
-                        # Outer region: 16x16 merged patches
-                        # Only keep top-left patch of each 2x2 block
-                        if i % 2 == 0 and j % 2 == 0:
-                            # Check if all 4 patches in the 2x2 block are valid
-                            block_valid = True
-                            for di in range(2):
-                                for dj in range(2):
-                                    ni, nj = i + di, j + dj
-                                    if ni >= self.grid_size or nj >= self.grid_size:
-                                        block_valid = False
-                                        break
-                                    block_dist = math.sqrt((ni - self.center) ** 2 + (nj - self.center) ** 2)
-                                    if block_dist > self.R_keep:
-                                        block_valid = False
-                                        break
-                                if not block_valid:
-                                    break
-
-                            if block_valid:
-                                self.outer_patches.append((i, j))
-                                self.patch_to_outer_token[(i, j)] = outer_token_idx
-                                outer_token_idx += 1
-                                for di in range(2):
-                                    for dj in range(2):
-                                        ni, nj = i + di, j + dj
-                                        self.patch_region[(ni, nj)] = 'outer'
+                if dist <= self.R_center:
+                    self.center_patches.append((i, j))
+                    self.patch_region[(i, j)] = 'center'
+                elif dist <= self.R_keep:
+                    self.patch_region[(i, j)] = 'outer'
                 else:
-                    # Discarded patch
                     self.discarded_patches.append((i, j))
                     self.patch_region[(i, j)] = 'discarded'
+
+        # Outer patches are the valid 2x2 block top-left corners
+        self.outer_patches = valid_outer_blocks
 
         # Token counts
         self.num_center_tokens = len(self.center_patches)
@@ -170,17 +163,19 @@ class FoveatedPatchEmbed(nn.Module):
             dtype=torch.long
         )
 
-        # Create indices for gathering outer region patches (each outer patch has 4 base patches)
-        outer_patch_indices = []
-        for i, j in self.outer_patches:
+        # Create indices for gathering outer region patch blocks
+        # For each outer block, we need indices for all 4 patches
+        self.outer_block_indices = []
+        for (i, j) in self.outer_patches:
+            block_indices = []
             for di in range(2):
                 for dj in range(2):
-                    outer_patch_indices.append(i * self.grid_size + j + di * self.grid_size + dj)
-        self.outer_patch_indices = torch.tensor(outer_patch_indices, dtype=torch.long)
+                    ni, nj = i + di, j + dj
+                    block_indices.append(ni * self.grid_size + nj)
+            self.outer_block_indices.append(block_indices)
 
         # Register buffers for efficient indexing
         self.register_buffer('center_idx', self.center_patch_indices)
-        self.register_buffer('outer_idx', self.outer_patch_indices)
 
     def forward(self, x):
         """
@@ -210,15 +205,17 @@ class FoveatedPatchEmbed(nn.Module):
         else:
             center_embeddings = torch.empty(B, 0, self.hidden_size, device=x.device, dtype=x.dtype)
 
-        # Create embeddings for outer region (16x16 patches = 4x 8x8 patches concatenated)
+        # Create embeddings for outer region (2x2 blocks merged to 16x16)
         if self.num_outer_tokens > 0:
-            # Gather outer patches: (B, num_outer * 4, 192)
-            outer_patches = x_patches[:, self.outer_idx, :]
-            # Reshape to (B, num_outer, 4, 192) and concatenate
-            outer_patches = outer_patches.view(B, self.num_outer_tokens, 4, -1)
-            outer_patches = outer_patches.reshape(B, self.num_outer_tokens, -1)  # (B, num_outer, 768)
-            # Project to hidden size (16*16*3 = 768 -> hidden_size)
-            outer_embeddings = self.outer_proj(outer_patches)  # (B, num_outer, hidden)
+            # Gather all patches for each outer block and merge
+            outer_embeddings = []
+            for block_indices in self.outer_block_indices:
+                indices_tensor = torch.tensor(block_indices, device=x.device, dtype=torch.long)
+                block_patches = x_patches[:, indices_tensor, :]  # (B, 4, 192)
+                block_merged = block_patches.reshape(B, -1)  # (B, 768)
+                block_embedding = self.outer_proj(block_merged)  # (B, hidden)
+                outer_embeddings.append(block_embedding)
+            outer_embeddings = torch.stack(outer_embeddings, dim=1)  # (B, num_outer, hidden)
         else:
             outer_embeddings = torch.empty(B, 0, self.hidden_size, device=x.device, dtype=x.dtype)
 
@@ -368,7 +365,7 @@ class FoveatedEmbeddings(nn.Module):
         Interpolate position embeddings for the foveated grid.
 
         For center patches, use their original positions.
-        For outer patches, use the average of their 4 component positions.
+        For outer patches, use the average of their 2x2 block positions.
         """
         B, N, C = 1, self.num_patches + 1, embed_dim
         foveated_pos_embed = torch.zeros(B, N, C)
@@ -469,9 +466,9 @@ class FoveatedViT(nn.Module):
     Foveated Vision Transformer
 
     A variant of ViT that simulates foveated vision:
-    - Center region: high resolution (8x8 patches)
-    - Outer region: lower resolution (16x16 merged patches)
-    - Circular cropping removes corner patches
+    - Center region: high resolution (8x8 patches, r <= 10.5)
+    - Outer region: lower resolution (16x16 merged patches, 10.5 < r <= 13.5)
+    - Circular cropping removes corner patches (r > 13.5)
     """
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False,
                  base_patch_size=8):
@@ -555,8 +552,8 @@ def get_foveated_b16_full_config():
     """Returns a FoveatedViT configuration with same capacity as ViT-B/16.
 
     Maintains the foveated sampling design:
-    - Center region: 8x8 patches (high resolution)
-    - Outer region: 16x16 merged patches (lower resolution)
+    - Center region: 8x8 patches (high resolution, r <= 10.5)
+    - Outer region: 16x16 merged patches (2x2 blocks, 10.5 < r <= 13.5)
     - Circular cropping with R_keep=13.5
 
     Architecture matches ViT-B/16:

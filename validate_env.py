@@ -5,6 +5,7 @@ FoveatedViT 验证脚本
 """
 
 import sys
+import os
 print("Python version:", sys.version)
 
 # 1. 测试基础库

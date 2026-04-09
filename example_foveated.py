@@ -46,7 +46,7 @@ def example_basic_usage():
     # Get token information
     token_info = model.get_token_info()
     print(f"\nToken Information:")
-    print(f"  Center tokens (8x8 patches): {token_info['num_center_tokens']}")
+    print(f"  Center tokens (8x8 patches, r <= 10.5): {token_info['num_center_tokens']}")
     print(f"  Outer tokens (16x16 merged): {token_info['num_outer_tokens']}")
     print(f"  Total tokens (excl. cls): {token_info['num_total_tokens']}")
     print(f"  Total tokens (incl. cls): {token_info['num_total_tokens'] + 1}")
@@ -104,7 +104,7 @@ def example_token_statistics():
 
     print(f"\n  Discarded region (r > 13.5):")
     print(f"    - {len(token_info['discarded_patches'])} patches")
-    print(f"    - Corners are discarded")
+    print(f"    - Corner patches are discarded")
 
     # Show some example patches
     print(f"\nExample center patches (first 5):")
@@ -113,7 +113,7 @@ def example_token_statistics():
 
     print(f"\nExample outer patches (first 5):")
     for i, (row, col) in enumerate(token_info['outer_patches'][:5]):
-        print(f"  [{i}] Top-left at Row {row}, Col {col} (covers {row}:{row+2}, {col}:{col+2})")
+        print(f"  [{i}] Top-left at Row {row}, Col {col} (covers 2x2 block: {row}:{row+2}, {col}:{col+2})")
 
 
 def example_forward_comparison():
